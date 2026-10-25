@@ -2,7 +2,7 @@
 
 检测本地 Codex CLI 实际调用的是哪个 GPT 模型。脚本让模型凭第一反应写出约 300 个 1–355 的整数，将数字分布与 [lm-detector](https://github.com/Ikaleio/lm-detector) 参考库比对。指纹数据与算法均来自 lm-detector，只需系统自带的 python3，无需安装依赖。
 
-![example](./example.png)
+<img src="./example.png" alt="example" width="548">
 
 ## 用法
 
