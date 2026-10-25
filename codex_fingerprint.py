@@ -32,6 +32,9 @@ from statistics import median
 DATA_FILES = ("bundle.json", "shared_detector.bin", "templates.json")
 REMOTE_DATA = "https://raw.githubusercontent.com/haowang02/codex-cli-fingerprint/main/data/"
 
+# 参考库中 gpt-6.1-sol 与 gpt-6-astra 共用一个指纹，其余模型名即参考库中的模型 ID
+MODEL_ALIASES = {"gpt-6.1-sol": "gpt-6-astra"}
+
 
 def read_data() -> dict[str, bytes]:
     script = globals().get("__file__")
@@ -326,7 +329,7 @@ def run_codex(prompt: str, model: str | None, effort: str) -> str:
 def main() -> None:
     sys.stdout.reconfigure(encoding="utf-8")
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("-m", "--model", help="Codex 模型名，省略则使用本地默认模型")
+    parser.add_argument("-m", "--model", required=True, help="要测试的 Codex 模型名")
     parser.add_argument("-r", "--reasoning-effort", default="low", help="推理强度，默认 low，与参考库中 GPT 样本一致")
     args = parser.parse_args()
 
@@ -364,24 +367,27 @@ def main() -> None:
 
     print()
     if not replies:
-        print("没有有效回答，无法评分")
+        print("测试失败：没有有效回答")
         return
     if not model_like(replies):
-        print("不像语言模型的回答：相邻数字的变化规律与参考库中的模型回答不符，未生成排名")
+        print("测试失败：不像语言模型的回答，相邻数字的变化规律与参考库中的模型回答不符")
         return
     ranking, probabilities = analyze(replies, detector)
+    order = sorted(range(len(models)), key=lambda i: -ranking[i])
     # 排名在全部参考模型上计算，只列出前 5 名 GPT 模型
-    shown = [i for i in sorted(range(len(models)), key=lambda i: -ranking[i]) if models[i]["family"] == "gpt"][:5]
+    shown = [i for i in order if models[i]["family"] == "gpt"][:5]
     width = max(len(models[i]["display_name"]) for i in shown)
     print(f"{'#':>2}  {'Model':<{width}}  {'Score':>7}  {'Confidence':>10}")
     for place, i in enumerate(shown, 1):
         confidence = f"{probabilities[i] * 100:.1f}%" if probabilities else "-"
         print(f"{place:>2}  {models[i]['display_name']:<{width}}  {ranking[i]:>7.3f}  {confidence:>10}")
+
+    # 归因模型取全部参考模型中的第一名
     print()
-    if probabilities:
-        print(f"置信度为 lm-detector 参考库（{detector['bank_built_at'][:10]}，{len(models)} 个模型）内的闭集概率，不涵盖库外模型")
+    if MODEL_ALIASES.get(args.model, args.model) == models[order[0]]["id"]:
+        print("\033[32m✓ 与测试模型一致\033[0m")
     else:
-        print(f"仅 {len(replies)}/3 条回答有效，只给出排名，不计算置信度")
+        print("\033[31m✗ 与测试模型不一致\033[0m")
 
 
 if __name__ == "__main__":
