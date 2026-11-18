@@ -1,8 +1,8 @@
 # Codex CLI 指纹检测
 
-检测本地 Codex CLI 实际调用的 GPT 模型。脚本让模型凭第一反应写出约 300 个 1–355 的整数，再与参考库比对。当前参考库包含 72 个指纹类别，其中包括 GPT‑6.2 Sol 和 Astra。脚本只使用 Python 3 标准库。指纹数据和检测算法来自 [lm-detector](https://github.com/Ikaleio/lm-detector/tree/33fb43f26670be0ed7817ab13e5c4c4731ccb76a)。
+检测本地 Codex CLI 实际调用的模型。脚本让模型凭第一反应写出约 300 个 1–355 的整数，再与参考库中的 72 个指纹类别比对。脚本只使用 Python 3 标准库。指纹数据和检测算法来自 [lm-detector](https://github.com/Ikaleio/lm-detector/tree/33fb43f26670be0ed7817ab13e5c4c4731ccb76a)。
 
-<img src="./example.png" alt="GPT-6.2 Sol 指纹检测结果，排名第一，置信度 97.9%" width="760">
+<img src="./example.png" alt="用 GPT-6.2 Sol 测试的指纹检测结果" width="760">
 
 ## 用法
 
@@ -29,7 +29,7 @@ wget -qO- https://is.gd/codex_fingerprint | python3 - -m gpt-6.2-sol
 - `-m, --model`：要测试的 Codex 模型名（必填）
 - `-r, --reasoning-effort`：推理强度，默认 `low`，与参考库中 GPT 样本的采集条件一致
 
-每次运行并行发送 3 个挑战。脚本在整个参考库中评分，列出排名最高的 5 个 GPT 候选，并用全库第一名判断是否与测试模型一致。3 条回答均有效且校准参数与检测器匹配时，才显示置信度。置信度是参考库内的闭集概率，库外模型也会匹配到库内最接近的候选。
+每次运行并行发送 3 个挑战，列出参考库中得分最高的 5 个候选，并用第一名判断是否与测试模型一致。三条回答都有效时才会显示置信度。
 
 ## 致谢
 

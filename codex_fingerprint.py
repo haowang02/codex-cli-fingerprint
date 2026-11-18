@@ -42,7 +42,6 @@ class Challenge(NamedTuple):
 class Candidate(NamedTuple):
     model_id: str
     display_name: str
-    family: str
     score: float
     probability: float | None
 
@@ -397,7 +396,7 @@ def score_replies(replies: list[list[int]], models: list[dict], detector: dict) 
         raise ValueError("排名计算产生无效数值")
     probabilities = calibrated_probabilities(scores, detector) if len(replies) == SAMPLE_COUNT else None
     candidates = [
-        Candidate(model["id"], model["display_name"], model["family"], score, probability)
+        Candidate(model["id"], model["display_name"], score, probability)
         for model, score, probability in zip(models, scores, probabilities or [None] * len(scores))
     ]
     return sorted(candidates, key=lambda candidate: -candidate.score)
@@ -470,13 +469,13 @@ def collect_replies(executable: str, challenges: list[Challenge], model: str, ef
 
 
 def print_ranking(candidates: list[Candidate], model: str) -> None:
-    shown = [candidate for candidate in candidates if candidate.family == "gpt"][:5]
-    width = max((len(candidate.display_name) for candidate in shown), default=5)
-    print(f"{'#':>2}  {'Model':<{width}}  {'Score':>7}  {'Confidence':>10}")
+    shown = candidates[:5]
+    width = max(len(candidate.display_name) for candidate in shown)
+    print(f"#  {'Model':<{width}}  {'Score':>7}  {'Confidence':>10}")
     for place, candidate in enumerate(shown, 1):
         probability = candidate.probability
         confidence = f"{probability:.1%}" if probability is not None else "-"
-        print(f"{place:>2}  {candidate.display_name:<{width}}  {candidate.score:>7.3f}  {confidence:>10}")
+        print(f"{place}  {candidate.display_name:<{width}}  {candidate.score:>7.3f}  {confidence:>10}")
 
     print()
     if MODEL_ALIASES.get(model, model) == candidates[0].model_id:
