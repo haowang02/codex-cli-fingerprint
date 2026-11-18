@@ -2,7 +2,7 @@
 
 检测本地 Codex CLI 实际调用的 GPT 模型。脚本让模型凭第一反应写出约 300 个 1–355 的整数，再与参考库比对。当前参考库包含 72 个指纹类别，其中包括 GPT‑6.2 Sol 和 Astra。脚本只使用 Python 3 标准库。指纹数据和检测算法来自 [lm-detector](https://github.com/Ikaleio/lm-detector/tree/33fb43f26670be0ed7817ab13e5c4c4731ccb76a)。
 
-<img src="./example.png" alt="example" width="548">
+<img src="./example.png" alt="GPT-6.2 Sol 指纹检测结果，排名第一，置信度 97.9%" width="760">
 
 ## 用法
 
