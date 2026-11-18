@@ -1,13 +1,10 @@
 #!/usr/bin/env python3
-"""Codex CLI 模型指纹检测，指纹数据与算法来自 lm-detector
-    python3 codex_fingerprint.py -m gpt-6.1-sol
-
-让模型凭第一反应写出约 300 个 1–355 的整数，将数字分布与参考库比对，列出最接近的 GPT 模型。
-"""
+"""用数字指纹检测本地 Codex CLI 实际调用的模型。"""
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -23,371 +20,493 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from operator import mul
 from pathlib import Path
 from statistics import median
+from typing import List, NamedTuple, Sequence
 
-# data/ 中的文件原样取自 lm-detector（https://github.com/Ikaleio/lm-detector）：
-#   bundle.json          参考库模型列表（https://lm.ikale.io/data/bundle.json）
-#   shared_detector.bin  检测器参数（data/shared_detector.bin）
-#   templates.json       挑战提示词模板（sdk/conformance/templates.json）
-# 本地运行时读取脚本同目录下的 data/，通过管道运行时从 GitHub 下载。
 DATA_FILES = ("bundle.json", "shared_detector.bin", "templates.json")
 REMOTE_DATA = "https://raw.githubusercontent.com/haowang02/codex-cli-fingerprint/main/data/"
-
-# 参考库中 gpt-6.1-sol 与 gpt-6-astra 共用一个指纹，其余模型名即参考库中的模型 ID
+DETECTOR_SCHEMA = "shared-detector-v2"
+SAMPLE_COUNT = 3
+MAX_VALUE = 355
+PSEUDOCOUNT = 0.5
+DISTRIBUTION_WEIGHTS = (0.75, 0.25)
 MODEL_ALIASES = {"gpt-6.1-sol": "gpt-6-astra"}
+
+Vector = List[float]
+
+
+class Challenge(NamedTuple):
+    prompt: str
+    expected_count: int
+
+
+class Candidate(NamedTuple):
+    model_id: str
+    display_name: str
+    family: str
+    score: float
+    probability: float | None
 
 
 def read_data() -> dict[str, bytes]:
-    script = globals().get("__file__")
-    local = Path(script).resolve().parent / "data" if script else None
-    if local and all((local / name).is_file() for name in DATA_FILES):
+    local = Path(__file__).resolve().parent / "data"
+    if all((local / name).is_file() for name in DATA_FILES):
         return {name: (local / name).read_bytes() for name in DATA_FILES}
+
     print("正在从 GitHub 下载指纹数据...", flush=True)
-    return {name: urllib.request.urlopen(REMOTE_DATA + name, timeout=120).read() for name in DATA_FILES}
+    data = {}
+    for name in DATA_FILES:
+        with urllib.request.urlopen(REMOTE_DATA + name, timeout=120) as response:
+            data[name] = response.read()
+    return data
 
 
 def decode_detector(data: bytes) -> dict:
-    """解码 shared_detector.bin：4 字节头长度、JSON 头、4 字节对齐的 float32 数据。
-    float32 按字节平面存放（先存所有值的第 1 个字节，依此类推），头中的数组记为 {"$f32": 偏移, "n": 长度}。"""
-    (header_length,) = struct.unpack_from("<I", data, 0)
-    start = (4 + header_length + 3) // 4 * 4
-    count = (len(data) - start) // 4
-    raw = bytearray(count * 4)
-    for byte in range(4):
-        raw[byte::4] = data[start + byte * count:start + (byte + 1) * count]
+    """读取长度前缀的 JSON 头和按字节平面存放的 float32 参数。"""
+    if len(data) < 4:
+        raise ValueError("检测器数据不完整")
+    (header_length,) = struct.unpack_from("<I", data)
+    header_end = 4 + header_length
+    start = (header_end + 3) // 4 * 4
+    size = len(data) - start
+    if size < 0 or size % 4:
+        raise ValueError("检测器数据不完整")
+
+    count = size // 4
+    raw = bytearray(size)
+    for plane in range(4):
+        raw[plane::4] = data[start + plane * count:start + (plane + 1) * count]
     values = struct.unpack(f"<{count}f", raw)
 
-    def expand(value: dict):
-        return list(values[value["$f32"]:value["$f32"] + value["n"]]) if "$f32" in value else value
+    def expand(value):
+        if "$f32" not in value:
+            return value
+        offset = value["$f32"]
+        return list(values[offset:offset + value["n"]])
 
-    return json.loads(data[4:4 + header_length].decode("utf-8"), object_hook=expand)
+    return json.loads(data[4:header_end], object_hook=expand)
 
 
-def load_reference():
+def load_reference() -> tuple[list[dict], dict, list[dict]]:
     data = read_data()
-    models = json.loads(data["bundle.json"])["models"]
-    detector = decode_detector(data["shared_detector.bin"])
-    if [m["id"] for m in models] != detector["model_ids"]:
-        raise RuntimeError("bundle.json 与 shared_detector.bin 版本不一致")
+    bundle = json.loads(data["bundle.json"])
+    binary = data["shared_detector.bin"]
+    if hashlib.sha256(binary).hexdigest() != bundle["files"]["shared_detector.bin"]["sha256"]:
+        raise ValueError("检测器文件的 SHA-256 与参考库清单不匹配")
+
+    detector = decode_detector(binary)
+    models = bundle["models"]
+    if (
+        bundle["schema"] != "lmfpd-data-v1"
+        or bundle["detector_schema"] != DETECTOR_SCHEMA
+        or detector["schema"] != DETECTOR_SCHEMA
+        or bundle["built_at"] != detector["bank_built_at"]
+        or [model["id"] for model in models] != detector["model_ids"]
+        or [model["response_count"] for model in models] != detector["response_counts"]
+    ):
+        raise ValueError("参考库清单与检测器版本不一致")
+
     return models, detector, json.loads(data["templates.json"])["languages"]
 
 
-def generate_challenges(templates: list[dict]) -> list[dict]:
-    """生成 3 个挑战：各自随机选一种语言，要求的整数个数取 292–332 中互不相同的值。"""
-    available = list(range(292, 333))
+def generate_challenges(templates: list[dict]) -> list[Challenge]:
     challenges = []
-    for _ in range(3):
-        count = available.pop(secrets.randbelow(len(available)))
-        lang = secrets.choice(templates)
-        request = lang["request"].replace("{action}", secrets.choice(lang["actions"])).replace("{count}", str(count))
-        prompt = lang["space"].join([secrets.choice(lang["openings"]), request, lang["rules"],
-                                     secrets.choice(lang["endings"]), secrets.choice(lang["separators"]), lang["start"]])
-        challenges.append({"expected_count": count, "prompt": prompt})
+    counts = secrets.SystemRandom().sample(range(292, 333), SAMPLE_COUNT)
+    for count in counts:
+        language = secrets.choice(templates)
+        action = secrets.choice(language["actions"])
+        request = language["request"].replace("{action}", action).replace("{count}", str(count))
+        prompt = language["space"].join([
+            secrets.choice(language["openings"]),
+            request,
+            language["rules"],
+            secrets.choice(language["endings"]),
+            secrets.choice(language["separators"]),
+            language["start"],
+        ])
+        challenges.append(Challenge(prompt, count))
     return challenges
 
 
-# ---------------------------------------------------------------- 特征提取（移植自 shared/fingerprint-core.js、shared/positional.ts）
-
 def parse_numbers(text: str) -> list[int]:
-    """提取回答中最长的一段 1–355 的整数；两个数字之间出现字母时另起一段。"""
+    """取最长的一段有效整数，数字之间的字母会分隔段落。"""
     best: list[int] = []
     current: list[int] = []
     previous_end = 0
-    for match in re.finditer(r"[0-9]+", text):  # 只匹配 ASCII 数字
+    for match in re.finditer(r"[0-9]+", text):
         if current and any(c.isalpha() for c in text[previous_end:match.start()]):
-            best = current if len(current) > len(best) else best
+            if len(current) > len(best):
+                best = current
             current = []
-        value = int(match.group())
-        if 1 <= value <= 355:
-            current.append(value)
         previous_end = match.end()
+        digits = match.group().lstrip("0")
+        if 1 <= len(digits) <= 3:
+            value = int(digits)
+            if value <= MAX_VALUE:
+                current.append(value)
     return current if len(current) > len(best) else best
 
 
-def mean(values) -> float:
+def mean(values: Sequence[float]) -> float:
     return sum(values) / len(values)
 
 
-def dot(a, b) -> float:
+def dot(a: Vector, b: Vector) -> float:
     return sum(map(mul, a, b))
 
 
-def unit(values: list[float]) -> list[float]:
+def normalize(values: Vector) -> Vector:
     scale = max(math.sqrt(dot(values, values)), 1e-12)
-    return [v / scale for v in values]
+    return [value / scale for value in values]
 
 
-def z(values: list[float]) -> list[float]:
+def center_and_variance(values: Sequence[float]) -> tuple[Vector, float]:
     center = mean(values)
-    scale = max(math.sqrt(mean([(v - center) ** 2 for v in values])), 1e-12)
-    return [(v - center) / scale for v in values]
+    deviations = [value - center for value in values]
+    return deviations, mean([value ** 2 for value in deviations])
 
 
-def column_mean(rows: list[list[float]]) -> list[float]:
+def z_scores(values: Vector) -> Vector:
+    deviations, variance = center_and_variance(values)
+    scale = max(math.sqrt(variance), 1e-12)
+    return [value / scale for value in deviations]
+
+
+def column_means(rows: list[Vector]) -> Vector:
     return [mean(column) for column in zip(*rows)]
 
 
-def hellinger_feature(numbers: list[int]) -> list[float]:
-    counts = [0] * 355
-    for value in numbers:
-        counts[value - 1] += 1
-    total = len(numbers) + 0.5 * 355
-    return [math.sqrt((c + 0.5) / total) for c in counts]
+def lag_differences(numbers: list[int], lag: int) -> list[int]:
+    return [right - left for left, right in zip(numbers, numbers[lag:])]
 
 
-def ordered_block_feature(numbers: list[int]) -> list[float]:
-    """按顺序均分为四段，每段统计 16 档取值直方图，再加上个位数直方图，均取平方根缩放。"""
-    base, remainder = divmod(len(numbers), 4)
-    pieces: list[float] = []
-    start = 0
-    for index in range(4):
-        size = base + (1 if index < remainder else 0)
-        bins = [0.5] * 16
-        for value in numbers[start:start + size]:
-            bins[min(15, math.floor((value - 1) / 355 * 16))] += 1
-        pieces += [math.sqrt(b / sum(bins)) for b in bins]
-        start += size
-    digits = [0.5] * 10
-    for value in numbers:
-        digits[value % 10] += 1
-    return pieces + [math.sqrt(d / sum(digits)) for d in digits]
+def sequence_shape(numbers: list[int]) -> tuple[float, float, float]:
+    centered, variance = center_and_variance(numbers)
+    autocorrelation = mean([a * b for a, b in zip(centered, centered[1:])]) / variance if variance else 1.0
 
-
-def position_kernel(x: list[int]) -> list[float]:
-    n = len(x)
-    centres = [1 + i * 354 / 23 for i in range(24)]
-    out = [0.0] * (34 * 3)
-    for position, value in enumerate(x):
-        t = (position + 0.5) * 2 / n - 1
-        basis = (t, 0.5 * (3 * t * t - 1), 0.5 * (5 * t ** 3 - 3 * t))
-        features = [math.exp(-0.5 * ((value - centre) / 20) ** 2) for centre in centres]
-        features += [1 if digit == value % 10 else 0 for digit in range(10)]
-        for k, weight in enumerate(features):
-            for j, b in enumerate(basis):
-                out[k * 3 + j] += weight * b / n
-    return out
-
-
-def centred_transitions(symbols: list[int], bins: int) -> list[float]:
-    joint = [0.5] * (bins * bins)
-    for a, b in zip(symbols, symbols[1:]):
-        joint[a * bins + b] += 1
-    total = len(symbols) - 1 + 0.5 * bins * bins
-    joint = [v / total for v in joint]
-    rows = [sum(joint[a * bins:a * bins + bins]) for a in range(bins)]
-    columns = [sum(joint[a * bins + b] for a in range(bins)) for b in range(bins)]
-    return [v - rows[i // bins] * columns[i % bins] for i, v in enumerate(joint)]
-
-
-def sequence_features(x: list[int]) -> list[float]:
-    n = len(x)
-    m = mean(x)
-    sd = max(math.sqrt(mean([(v - m) ** 2 for v in x])), 1)
-    s = [(v - m) / sd for v in x]
-    out: list[float] = []
-    for lag in (1, 2, 3, 5, 8, 13, 21, 34):
-        count = n - lag
-        d = [x[i + lag] - x[i] for i in range(count)]
-        out += [mean([s[i + lag] * s[i] for i in range(count)]), mean([abs(v) for v in d]) / 355,
-                sum(v > 0 for v in d) / count, sum(v == 0 for v in d) / count,
-                sum(abs(v) <= 5 for v in d) / count, sum(abs(v) <= 20 for v in d) / count]
-    out += centred_transitions([min(7, math.floor((v - 1) * 8 / 355)) for v in x], 8)
-    out += centred_transitions([v % 10 for v in x], 10)
-    difference = [x[i + 1] - x[i] for i in range(n - 1)]
-    sign = [(d > 0) - (d < 0) for d in difference]
-    z_step = [abs(s[i + 1] - s[i]) for i in range(n - 1)]
-    out += [sum(sign[i + 1] == sign[i] for i in range(n - 2)) / (n - 2),
-            sum(difference[i + 1] == difference[i] for i in range(n - 2)) / (n - 2),
-            sum(x[i] % 10 == x[i + 1] % 10 for i in range(n - 1)) / (n - 1),
-            sum(v > 1 for v in z_step) / (n - 1), sum(v > 2 for v in z_step) / (n - 1)]
-    buckets = [min(15, math.floor((v - 1) * 16 / 355)) for v in x]
-    for width in (4, 8, 16):
-        total = 0.0
-        for i in range(n - width + 1):
-            total += len(set(buckets[i:i + width])) / width
-        out.append(total / (n - width + 1))
-    return out
-
-
-# ---------------------------------------------------------------- 排名与置信度（移植自 shared/shared-detector.ts）
-
-def transform(numbers: list[int], params: list[dict]) -> list[float]:
-    out: list[float] = []
-    for block, p, weight in zip((hellinger_feature(numbers), ordered_block_feature(numbers)), params, (0.75, 0.25)):
-        out += [v * math.sqrt(weight) for v in unit([(v - m) / s for v, m, s in zip(block, p["mean"], p["scale"])])]
-    return out
-
-
-def nearest(x: list[float], references: list[list[float]]) -> float:
-    """与某个模型最近的 7 个参考向量的平均平方距离。"""
-    xx = dot(x, x)
-    return mean(sorted(max(0, xx + dot(ref, ref) - 2 * dot(x, ref)) for ref in references)[:7])
-
-
-def subtract(values: list[float], basis: list[list[float]]) -> list[float]:
-    coefficients = [dot(values, row) for row in basis]
-    return [v - sum(c * row[i] for c, row in zip(coefficients, basis)) for i, v in enumerate(values)]
-
-
-def baseline(numbers: list[int], bank: dict) -> list[float]:
-    h, o = bank["hellinger"], bank["ordered_blocks"]
-
-    def centered(block, p):
-        return [(v - m) / s for v, m, s in zip(block, p["feature_mean"], p["feature_scale"])]
-
-    h_unit = unit(subtract(centered(hellinger_feature(numbers), h), h["nuisance_basis"]))
-    marginal = [dot(h_unit, row) for row in h["centroids"]]
-    o_centered = centered(ordered_block_feature(numbers), o)
-    raw, projected = unit(o_centered), unit(subtract(o_centered, o["nuisance_basis"]))
-    templates = [max(dot(raw, rows[i]) for rows in o["environment_centroids"]) for i in range(len(o["centroids"]))]
-    nuisance = [dot(projected, row) for row in o["centroids"]]
-    ordered = z([0.5 * a + 0.5 * b for a, b in zip(z(templates), z(nuisance))])
-    return [0.5 * a + 0.5 * b for a, b in zip(z(marginal), ordered)]
-
-
-def positional(numbers: list[int], head: dict) -> list[float]:
-    blocks = (hellinger_feature(numbers), ordered_block_feature(numbers), position_kernel(numbers),
-              sequence_features(numbers))
-    x: list[float] = []
-    for block, p, weight in zip(blocks, head["params"], (0.6, 0.15, 0.125, 0.125)):
-        scaled = [(v - m) / s for v, m, s in zip(block, p["mean"], p["scale"])]
-        length = max(math.sqrt(sum(v * v for v in scaled)), 1e-12)
-        x += [v / length * math.sqrt(weight) for v in scaled]
-    return [sum(map(mul, row, x), bias) for row, bias in zip(head["weights"], head["bias"])]
-
-
-def rank(replies: list[list[int]], r: dict) -> list[float]:
-    """计算每个参考模型的排名分数。"""
-    lda = []
-    for numbers in replies:
-        x = transform(numbers[:128], r["head_params"])
-        lda.append(z([dot(row, x) + bias for row, bias in zip(r["lda_weights"], r["lda_bias"])]))
-    full = [transform(numbers, r["full_params"]) for numbers in replies]
-    near = z([median([-nearest(x, references) for x in full]) for references in r["references"]])
-    base = z(column_mean([baseline(numbers, r["bank"]) for numbers in replies]))
-    frequency = z([0.5 * a + 0.25 * b + 0.25 * c for a, b, c in zip(z(column_mean(lda)), near, base)])
-    position = z(column_mean([z(positional(numbers, r["positional"])) for numbers in replies]))
-    return [r["blend"]["frequency"] * f + r["blend"]["positional"] * p for f, p in zip(frequency, position)]
+    steps = [lag_differences(numbers, lag) for lag in (1, 2, 3)]
+    close = [sum(abs(step) <= 20 for step in differences) for differences in steps]
+    return autocorrelation, close[0] / len(steps[0]), sum(close) / sum(map(len, steps))
 
 
 def model_like(replies: list[list[int]]) -> bool:
-    """语言模型的回答中，相邻数字通常呈负自相关，且相差 20 以内的比例很低；两项都不符合时判定为非模型回答。"""
-    autocorrelations, small_steps = [], []
-    for n in replies:
-        m = mean(n)
-        variance = mean([(v - m) ** 2 for v in n])
-        autocorrelations.append(mean([(b - m) * (a - m) for a, b in zip(n, n[1:])]) / variance if variance else 1)
-        small_steps.append(mean([abs(b - a) <= 20 for a, b in zip(n, n[1:])]))
-    return median(autocorrelations) <= -0.23 or median(small_steps) <= 0.05
+    shapes = [sequence_shape(reply) for reply in replies]
+    autocorrelation, small_steps, nearby_pairs = map(median, zip(*shapes))
+    return autocorrelation <= -0.23 or small_steps <= 0.05 or nearby_pairs <= 0.07
 
 
-def analyze(replies: list[list[int]], detector: dict):
-    """返回排名分数和置信度。置信度由温度 tau 校准，仅在 3 条回答均有效时计算。"""
-    ranking = rank(replies, detector["ranker"])
-    if len(replies) < 3:
-        return ranking, None
-    logits = [detector["calibration"]["tau"] * score for score in ranking]
-    weights = [math.exp(v - max(logits)) for v in logits]
-    return ranking, [w / sum(weights) for w in weights]
+def hellinger_histogram(indices: Sequence[int], bins: int) -> Vector:
+    counts = [PSEUDOCOUNT] * bins
+    for index in indices:
+        counts[index] += 1
+    total = len(indices) + PSEUDOCOUNT * bins
+    return [math.sqrt(count / total) for count in counts]
 
 
-# ---------------------------------------------------------------- Codex
+def distribution_features(numbers: list[int]) -> tuple[Vector, Vector]:
+    marginal = hellinger_histogram([value - 1 for value in numbers], MAX_VALUE)
+    buckets = [(value - 1) * 16 // MAX_VALUE for value in numbers]
+    base, remainder = divmod(len(numbers), 4)
+    ordered = []
+    start = 0
+    for index in range(4):
+        end = start + base + (index < remainder)
+        ordered.extend(hellinger_histogram(buckets[start:end], 16))
+        start = end
+    ordered.extend(hellinger_histogram([value % 10 for value in numbers], 10))
+    return marginal, ordered
+
+
+def position_kernel(numbers: list[int]) -> Vector:
+    count = len(numbers)
+    centres = [1 + index * (MAX_VALUE - 1) / 23 for index in range(24)]
+    features = [0.0] * ((len(centres) + 10) * 3)
+    for position, value in enumerate(numbers):
+        t = (position + 0.5) * 2 / count - 1
+        basis = (t, 0.5 * (3 * t * t - 1), 0.5 * (5 * t ** 3 - 3 * t))
+        weights = [math.exp(-0.5 * ((value - centre) / 20) ** 2) for centre in centres]
+        weights.extend(digit == value % 10 for digit in range(10))
+        for index, weight in enumerate(weights):
+            for degree, coefficient in enumerate(basis):
+                features[index * 3 + degree] += weight * coefficient / count
+    return features
+
+
+def centred_transitions(symbols: list[int], bins: int) -> Vector:
+    joint = [PSEUDOCOUNT] * (bins * bins)
+    for left, right in zip(symbols, symbols[1:]):
+        joint[left * bins + right] += 1
+    total = len(symbols) - 1 + PSEUDOCOUNT * len(joint)
+    joint = [value / total for value in joint]
+    rows = [sum(joint[start:start + bins]) for start in range(0, len(joint), bins)]
+    columns = [sum(joint[column::bins]) for column in range(bins)]
+    return [value - rows[index // bins] * columns[index % bins] for index, value in enumerate(joint)]
+
+
+def sequence_features(numbers: list[int]) -> Vector:
+    centered, variance = center_and_variance(numbers)
+    scale = max(math.sqrt(variance), 1)
+    standardized = [value / scale for value in centered]
+    features = []
+    for lag in (1, 2, 3, 5, 8, 13, 21, 34):
+        steps = lag_differences(numbers, lag)
+        magnitude = [abs(step) for step in steps]
+        features.extend((
+            mean([a * b for a, b in zip(standardized, standardized[lag:])]),
+            mean(magnitude) / MAX_VALUE,
+            mean([step > 0 for step in steps]),
+            mean([step == 0 for step in steps]),
+            mean([step <= 5 for step in magnitude]),
+            mean([step <= 20 for step in magnitude]),
+        ))
+
+    digits = [value % 10 for value in numbers]
+    features.extend(centred_transitions([(value - 1) * 8 // MAX_VALUE for value in numbers], 8))
+    features.extend(centred_transitions(digits, 10))
+
+    adjacent = lag_differences(numbers, 1)
+    signs = [(step > 0) - (step < 0) for step in adjacent]
+    standardized_steps = [abs(b - a) for a, b in zip(standardized, standardized[1:])]
+    features.extend((
+        mean([a == b for a, b in zip(signs, signs[1:])]),
+        mean([a == b for a, b in zip(adjacent, adjacent[1:])]),
+        mean([a == b for a, b in zip(digits, digits[1:])]),
+        mean([step > 1 for step in standardized_steps]),
+        mean([step > 2 for step in standardized_steps]),
+    ))
+
+    buckets = [(value - 1) * 16 // MAX_VALUE for value in numbers]
+    for width in (4, 8, 16):
+        features.append(mean([
+            len(set(buckets[start:start + width])) / width
+            for start in range(len(buckets) - width + 1)
+        ]))
+    return features
+
+
+def rescale(values: Vector, centers: Vector, scales: Vector) -> Vector:
+    return [(value - center) / scale for value, center, scale in zip(values, centers, scales)]
+
+
+def transform(blocks: Sequence[Vector], params: list[dict], weights: Sequence[float]) -> Vector:
+    features = []
+    for block, param, weight in zip(blocks, params, weights):
+        scaled = normalize(rescale(block, param["mean"], param["scale"]))
+        scale = math.sqrt(weight)
+        features.extend(value * scale for value in scaled)
+    return features
+
+
+def reference_similarity(queries: list[Vector], references: list[list[Vector]]) -> Vector:
+    query_norms = [dot(query, query) for query in queries]
+    scores = []
+    for model_references in references:
+        norms = [dot(ref, ref) for ref in model_references]
+        nearest_distances = []
+        for query, query_norm in zip(queries, query_norms):
+            distances = sorted(
+                max(0.0, query_norm + norm - 2 * dot(query, ref))
+                for norm, ref in zip(norms, model_references)
+            )
+            nearest_distances.append(mean(distances[:7]))
+        scores.append(-median(nearest_distances))
+    return scores
+
+
+def subtract_projection(values: Vector, basis: list[Vector]) -> Vector:
+    if not basis:
+        return values
+    coefficients = [dot(values, row) for row in basis]
+    return [value - dot(coefficients, column) for value, column in zip(values, zip(*basis))]
+
+
+def baseline(blocks: tuple[Vector, Vector], bank: dict) -> Vector:
+    marginal_bank = bank["hellinger"]
+    ordered_bank = bank["ordered_blocks"]
+    marginal = rescale(blocks[0], marginal_bank["feature_mean"], marginal_bank["feature_scale"])
+    marginal = normalize(subtract_projection(marginal, marginal_bank["nuisance_basis"]))
+    marginal_scores = z_scores([dot(marginal, row) for row in marginal_bank["centroids"]])
+
+    ordered = rescale(blocks[1], ordered_bank["feature_mean"], ordered_bank["feature_scale"])
+    raw = normalize(ordered)
+    projected = normalize(subtract_projection(ordered, ordered_bank["nuisance_basis"]))
+    environments = zip(*ordered_bank["environment_centroids"])
+    templates = z_scores([max(dot(raw, row) for row in rows) for rows in environments])
+    nuisance = z_scores([dot(projected, row) for row in ordered_bank["centroids"]])
+    ordered_scores = z_scores([(a + b) * 0.5 for a, b in zip(templates, nuisance)])
+    return [(a + b) * 0.5 for a, b in zip(marginal_scores, ordered_scores)]
+
+
+def rank(replies: list[list[int]], ranker: dict) -> Vector:
+    lda, queries, baselines, positional = [], [], [], []
+    head = ranker["positional"]
+    for numbers in replies:
+        blocks = distribution_features(numbers)
+        head_features = distribution_features(numbers[:128])
+        head_query = transform(head_features, ranker["head_params"], DISTRIBUTION_WEIGHTS)
+        lda.append(z_scores([
+            dot(row, head_query) + bias for row, bias in zip(ranker["lda_weights"], ranker["lda_bias"])
+        ]))
+        queries.append(transform(blocks, ranker["full_params"], DISTRIBUTION_WEIGHTS))
+        baselines.append(baseline(blocks, ranker["bank"]))
+
+        positional_blocks = (*blocks, position_kernel(numbers), sequence_features(numbers))
+        features = transform(positional_blocks, head["params"], (0.6, 0.15, 0.125, 0.125))
+        positional.append(z_scores([
+            sum(map(mul, row, features), bias) for row, bias in zip(head["weights"], head["bias"])
+        ]))
+
+    discriminant = z_scores(column_means(lda))
+    nearest = z_scores(reference_similarity(queries, ranker["references"]))
+    baseline_scores = z_scores(column_means(baselines))
+    frequency = z_scores([
+        0.5 * a + 0.25 * b + 0.25 * c for a, b, c in zip(discriminant, nearest, baseline_scores)
+    ])
+    position = z_scores(column_means(positional))
+    blend = ranker["blend"]
+    return [blend["frequency"] * f + blend["positional"] * p for f, p in zip(frequency, position)]
+
+
+def calibrated_probabilities(scores: Vector, detector: dict) -> Vector | None:
+    calibration = detector.get("calibration")
+    if not isinstance(calibration, dict):
+        return None
+    binding = calibration.get("binding")
+    tau = calibration.get("tau")
+    if (
+        calibration.get("schema") != "shared-confidence-v2"
+        or calibration.get("method") != "ranking-temperature"
+        or not isinstance(binding, dict)
+        or not isinstance(tau, (int, float))
+        or isinstance(tau, bool)
+        or not 0.001 <= tau <= 1000
+        or binding.get("base_sha256") != detector["base_sha256"]
+        or binding.get("reference_sha256") != detector["source_reference_sha256"]
+        or binding.get("model_ids") != detector["model_ids"]
+    ):
+        return None
+
+    maximum = max(scores)
+    weights = [math.exp(tau * (score - maximum)) for score in scores]
+    total = sum(weights)
+    return [weight / total for weight in weights]
+
+
+def score_replies(replies: list[list[int]], models: list[dict], detector: dict) -> list[Candidate]:
+    scores = rank(replies, detector["ranker"])
+    if len(scores) != len(models) or not all(map(math.isfinite, scores)):
+        raise ValueError("排名计算产生无效数值")
+    probabilities = calibrated_probabilities(scores, detector) if len(replies) == SAMPLE_COUNT else None
+    candidates = [
+        Candidate(model["id"], model["display_name"], model["family"], score, probability)
+        for model, score, probability in zip(models, scores, probabilities or [None] * len(scores))
+    ]
+    return sorted(candidates, key=lambda candidate: -candidate.score)
+
 
 def resolve_codex_executable() -> str:
-    """Windows 上无扩展名的 npm shim 无法直接启动，优先使用 codex.cmd。"""
+    # Windows 的 npm 安装依赖带扩展名的 shim。
     for name in ("codex.cmd", "codex.exe", "codex") if os.name == "nt" else ("codex",):
-        exe = shutil.which(name)
-        if exe:
-            return exe
+        executable = shutil.which(name)
+        if executable:
+            return executable
     raise RuntimeError("找不到 codex，请确认已安装并加入 PATH")
 
 
-def run_codex(prompt: str, model: str | None, effort: str) -> str:
-    cmd = [
-        resolve_codex_executable(), "exec", "--json",
-        "--skip-git-repo-check",
-        "-s", "read-only",
-        "--disable", "memories",  # 关闭跨会话记忆，避免历史内容混入上下文
-        "-c", f"model_reasoning_effort={effort}",
-        "-c", "notify=[]",
+def run_codex(executable: str, prompt: str, model: str, effort: str) -> str:
+    command = [
+        executable, "exec", "--json", "--skip-git-repo-check", "-s", "read-only",
+        "--disable", "memories", "-c", f"model_reasoning_effort={effort}", "-c", "notify=[]", "-m", model,
     ]
-    if model:
-        cmd += ["-m", model]
-    # 提示词经 stdin 传入，避免 Windows 下 codex.cmd 改写命令行参数
-    proc = subprocess.run(cmd, input=prompt, capture_output=True, text=True, encoding="utf-8", errors="replace")
-    if proc.returncode != 0:
-        raise RuntimeError(proc.stderr.strip() or proc.stdout.strip() or "codex exec 执行失败")
-    text = ""
-    for line in proc.stdout.splitlines():  # 取最后一条 agent_message 作为回答
+    process = subprocess.run(
+        command, input=prompt, capture_output=True, text=True, encoding="utf-8", errors="replace",
+    )
+    if process.returncode != 0:
+        raise RuntimeError(process.stderr.strip() or process.stdout.strip() or "codex exec 执行失败")
+    answer = ""
+    for line in process.stdout.splitlines():
         if line.startswith("{"):
             event = json.loads(line)
             item = event.get("item") or {}
             if event.get("type") == "item.completed" and item.get("type") == "agent_message":
-                text = item.get("text", "")
-    return text
+                answer = item.get("text", "")
+    return answer
 
 
-def main() -> None:
-    sys.stdout.reconfigure(encoding="utf-8")
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("-m", "--model", required=True, help="要测试的 Codex 模型名")
-    parser.add_argument("-r", "--reasoning-effort", default="low", help="推理强度，默认 low，与参考库中 GPT 样本一致")
-    args = parser.parse_args()
-
-    models, detector, templates = load_reference()
-    challenges = generate_challenges(templates)
-
-    def run_one(prompt: str):
+def collect_replies(executable: str, challenges: list[Challenge], model: str, effort: str) -> list[list[int]]:
+    def sample(prompt: str) -> tuple[list[int], float]:
         started = time.monotonic()
-        return parse_numbers(run_codex(prompt, args.model, args.reasoning_effort)), time.monotonic() - started
+        numbers = parse_numbers(run_codex(executable, prompt, model, effort))
+        return numbers, time.monotonic() - started
 
     row = "{:>1}  {:>4}  {:>4}  {:>7}  {}".format
     print(row("#", "Want", "Got", "Time(s)", "OK"))
-    print(row("-", "----", "----", "-------", "--"))
-    replies, errors = [], []
+    print(row("-", "----", "----", "-------", "--"), flush=True)
+    replies, errors = {}, {}
     with ThreadPoolExecutor(len(challenges)) as pool:
-        futures = {pool.submit(run_one, c["prompt"]): (i, c["expected_count"]) for i, c in enumerate(challenges, 1)}
+        futures = {
+            pool.submit(sample, challenge.prompt): (index, challenge.expected_count)
+            for index, challenge in enumerate(challenges, 1)
+        }
         for future in as_completed(futures):
             index, want = futures[future]
             try:
                 numbers, seconds = future.result()
-            except Exception as exc:
-                errors.append(f"#{index}: {' '.join(str(exc).split())}")
+            except (OSError, RuntimeError, ValueError) as exc:
+                errors[index] = " ".join(str(exc).split())
                 print(row(index, want, "-", "-", "✗"), flush=True)
                 continue
-            # 多出的整数截掉，不足下限的回答视为无效
+
             minimum = max(80, math.ceil(want * 0.55))
             ok = len(numbers) >= minimum
             if ok:
-                replies.append(numbers[:want])
+                replies[index] = numbers[:want]
             else:
-                errors.append(f"#{index}: 有效整数仅 {len(numbers)} 个，至少需要 {minimum} 个")
+                errors[index] = f"有效整数仅 {len(numbers)} 个，至少需要 {minimum} 个"
             print(row(index, want, len(numbers), f"{seconds:.1f}", "✓" if ok else "✗"), flush=True)
-    for error in sorted(errors):
-        print(error)
 
-    print()
-    if not replies:
-        print("测试失败：没有有效回答")
-        return
-    if not model_like(replies):
-        print("测试失败：不像语言模型的回答，相邻数字的变化规律与参考库中的模型回答不符")
-        return
-    ranking, probabilities = analyze(replies, detector)
-    order = sorted(range(len(models)), key=lambda i: -ranking[i])
-    # 排名在全部参考模型上计算，只列出前 5 名 GPT 模型
-    shown = [i for i in order if models[i]["family"] == "gpt"][:5]
-    width = max(len(models[i]["display_name"]) for i in shown)
+    for index, message in sorted(errors.items()):
+        print(f"#{index}: {message}")
+    return [replies[index] for index in sorted(replies)]
+
+
+def print_ranking(candidates: list[Candidate], model: str) -> None:
+    shown = [candidate for candidate in candidates if candidate.family == "gpt"][:5]
+    width = max((len(candidate.display_name) for candidate in shown), default=5)
     print(f"{'#':>2}  {'Model':<{width}}  {'Score':>7}  {'Confidence':>10}")
-    for place, i in enumerate(shown, 1):
-        confidence = f"{probabilities[i] * 100:.1f}%" if probabilities else "-"
-        print(f"{place:>2}  {models[i]['display_name']:<{width}}  {ranking[i]:>7.3f}  {confidence:>10}")
+    for place, candidate in enumerate(shown, 1):
+        probability = candidate.probability
+        confidence = f"{probability:.1%}" if probability is not None else "-"
+        print(f"{place:>2}  {candidate.display_name:<{width}}  {candidate.score:>7.3f}  {confidence:>10}")
 
-    # 归因模型取全部参考模型中的第一名
     print()
-    if MODEL_ALIASES.get(args.model, args.model) == models[order[0]]["id"]:
+    if MODEL_ALIASES.get(model, model) == candidates[0].model_id:
         print("\033[32m✓ 与测试模型一致\033[0m")
     else:
         print("\033[31m✗ 与测试模型不一致\033[0m")
+
+
+def main() -> None:
+    sys.stdout.reconfigure(encoding="utf-8")
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("-m", "--model", required=True, help="要测试的 Codex 模型名")
+    parser.add_argument(
+        "-r", "--reasoning-effort", default="low", help="推理强度，默认 low，与参考库中 GPT 样本一致",
+    )
+    args = parser.parse_args()
+
+    try:
+        executable = resolve_codex_executable()
+        models, detector, templates = load_reference()
+        replies = collect_replies(executable, generate_challenges(templates), args.model, args.reasoning_effort)
+        print()
+        if not replies:
+            print("测试失败：没有有效回答")
+        elif not model_like(replies):
+            print("测试失败：不像语言模型的回答，近邻数字的变化与参考库不符")
+        else:
+            print_ranking(score_replies(replies, models, detector), args.model)
+    except (OSError, RuntimeError, ValueError) as exc:
+        parser.exit(1, f"测试失败：{exc}\n")
 
 
 if __name__ == "__main__":
